@@ -578,7 +578,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
             search_providers = [
                 instance_id
                 for instance_id in all_search_providers
-                if (prov := self.mass.get_provider(instance_id))
+                if (prov := self.get_visible_provider(instance_id))
                 and (prov.instance_id in requested_providers or prov.domain in requested_providers)
             ]
         # use cache to avoid repeated searches; the library results are narrowed to what
@@ -2902,15 +2902,10 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
         :param soft_timeout: Seconds to wait before returning None while the search
                              continues in the background; None waits for it to finish.
         """
-        prov = self.mass.get_provider(
-            provider_instance_id_or_domain,
-            return_unavailable=strict_provider_instance,
-            provider_type=MediaCatalogMixin,
+        prov = visible_provider(
+            self.mass, provider_instance_id_or_domain, get_current_user(), strict_provider_instance
         )
-        if not prov or (
-            strict_provider_instance
-            and (prov.instance_id != provider_instance_id_or_domain or not prov.available)
-        ):
+        if not isinstance(prov, MediaCatalogMixin):
             return None if strict_provider_instance else SearchResults()
         if ProviderFeature.SEARCH not in prov.supported_features:
             return SearchResults()

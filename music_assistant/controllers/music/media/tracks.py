@@ -123,10 +123,16 @@ class TracksController(MediaControllerBase[Track]):
         # register (extra) api handlers
         api_base = self.api_base
         self.mass.register_api_command(
-            f"music/{api_base}/track_versions", self.versions, required_scope=Scope.LIBRARY_READ
+            f"music/{api_base}/track_versions",
+            self.versions,
+            required_scope=Scope.LIBRARY_READ,
+            allow_impersonation=True,
         )
         self.mass.register_api_command(
-            f"music/{api_base}/track_albums", self.albums, required_scope=Scope.LIBRARY_READ
+            f"music/{api_base}/track_albums",
+            self.albums,
+            required_scope=Scope.LIBRARY_READ,
+            allow_impersonation=True,
         )
         self.mass.register_api_command(
             f"music/{api_base}/preview", self.get_preview_url, required_scope=Scope.LIBRARY_READ
@@ -135,6 +141,7 @@ class TracksController(MediaControllerBase[Track]):
             f"music/{api_base}/similar_tracks",
             self.similar_tracks,
             required_scope=Scope.LIBRARY_READ,
+            allow_impersonation=True,
         )
 
     @property
@@ -421,14 +428,14 @@ class TracksController(MediaControllerBase[Track]):
         search_query = f"{track.artist_str} - {track.name}"
         result: UniqueList[Track] = UniqueList()
         for provider_id in self.mass.music.get_unique_providers():
-            provider = self.mass.get_provider(provider_id)
+            provider = self.mass.music.get_visible_provider(provider_id)
             if not isinstance(provider, MusicProvider):
                 continue
             if MediaType.TRACK not in provider.supported_media_types:
                 continue
             result.extend(
                 prov_item
-                for prov_item in await self.search(search_query, provider_id)
+                for prov_item in await self.search(search_query, provider.instance_id)
                 if loose_compare_strings(track.name, prov_item.name)
                 and compare_artists(prov_item.artists, track.artists, any_match=True)
                 # make sure that the 'base' version is NOT included
@@ -525,7 +532,7 @@ class TracksController(MediaControllerBase[Track]):
 
         # Try preferred providers first, then fall back to others
         for prov_mapping in sorted_mappings:
-            prov = self.mass.get_provider(prov_mapping.provider_instance)
+            prov = self.mass.music.get_visible_provider(prov_mapping.provider_instance)
             if (
                 not isinstance(prov, MusicProvider)
                 or ProviderFeature.SIMILAR_TRACKS not in prov.supported_features
@@ -671,6 +678,7 @@ class TracksController(MediaControllerBase[Track]):
         return await self.mass.music.albums.get_library_items_by_query(
             extra_query_parts=[query],
             extra_query_params={"track_id": db_id},
+            provider_filter=self._ensure_provider_filter(None),
             in_library_only=True,
         )
 
