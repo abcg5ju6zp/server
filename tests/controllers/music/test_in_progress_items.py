@@ -2,20 +2,21 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from collections.abc import Awaitable, Callable
 from unittest.mock import patch
 
+import pytest
 from music_assistant_models.auth import User, UserRole
 from music_assistant_models.config_entries import ProviderAccess
 from music_assistant_models.enums import MediaType, ProviderSharing
+from music_assistant_models.errors import InsufficientPermissions
 
 from music_assistant.constants import DB_TABLE_PLAYLOG, DB_TABLE_PROVIDER_MAPPINGS
+from music_assistant.controllers.music import MusicController
+from music_assistant.controllers.webserver.helpers.auth_middleware import set_current_user
 from music_assistant.helpers.datetime import utc_timestamp
 from music_assistant.mass import MusicAssistant
 from tests.common import set_music_source_access
-
-if TYPE_CHECKING:
-    import pytest
 
 GET_CURRENT_USER = "music_assistant.controllers.music.controller.get_current_user"
 
@@ -168,3 +169,41 @@ async def test_in_progress_items_excludes_unavailable_mapping(
     result = await mass.music.in_progress_items(limit=10, providers=["audible_1"])
 
     assert result == []
+
+
+@pytest.mark.parametrize(
+    "list_other_users_items",
+    [
+        pytest.param(lambda music: music.in_progress_items(all_users=True), id="all_users"),
+        pytest.param(
+            lambda music: music.recently_played(userid="user-b", fully_played_only=False),
+            id="userid",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("role", "allowed"),
+    [(UserRole.USER, False), (UserRole.SERVICE, True)],
+    ids=["member", "service"],
+)
+async def test_other_users_items_need_the_impersonate_scope(
+    mass: MusicAssistant,
+    monkeypatch: pytest.MonkeyPatch,
+    list_other_users_items: Callable[[MusicController], Awaitable[list[object]]],
+    role: str,
+    allowed: bool,
+) -> None:
+    """The legacy all_users and userid parameters reach other users' playlog only with the scope."""
+    monkeypatch.setattr(mass.music, "get_active_provider_instances", lambda: ["local_1"])
+    await _add_provider_mapping(mass, item_id=1, provider_instance="local_1")
+    await _add_in_progress_row(mass, "1", userid="user-b")
+    set_current_user(User(user_id="user-a", username="user-a", role=role))
+
+    try:
+        if allowed:
+            assert len(await list_other_users_items(mass.music)) == 1
+        else:
+            with pytest.raises(InsufficientPermissions):
+                await list_other_users_items(mass.music)
+    finally:
+        set_current_user(None)

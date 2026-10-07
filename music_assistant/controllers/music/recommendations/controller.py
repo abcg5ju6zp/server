@@ -41,6 +41,7 @@ class RecommendationsController:
             "music/recommendations",
             self.get_recommendations,
             required_scope=Scope.LIBRARY_READ,
+            allow_impersonation=True,
         )
         self.mass.register_api_command(
             "music/recommendations/items",

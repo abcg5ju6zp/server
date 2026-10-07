@@ -118,6 +118,7 @@ from music_assistant.controllers.tasks.context import (
     update_current_task_progress_text,
 )
 from music_assistant.controllers.webserver.helpers.auth_middleware import (
+    check_acting_user,
     get_current_user,
     has_player_access,
     player_access_filter,
@@ -926,7 +927,9 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
         prov_items = await cast("MediaCatalogMixin", browse_prov).browse(path=path)
         return [*prepend_items, *prov_items]
 
-    @api_command("music/recently_played_items", required_scope=Scope.LIBRARY_READ)
+    @api_command(
+        "music/recently_played_items", required_scope=Scope.LIBRARY_READ, allow_impersonation=True
+    )
     async def recently_played(
         self,
         limit: int = 10,
@@ -945,7 +948,8 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
 
         :param limit: Maximum number of items to return.
         :param media_types: Filter by media types.
-        :param userid: Filter by specific user ID.
+        :param userid: Filter by specific user ID. Deprecated, use the user argument;
+            another user's items need the users.impersonate scope.
         :param queue_id: Filter by specific queue ID.
         :param fully_played_only: If True, only return fully played items.
         :param user_initiated_only: If True, only return items initiated by the user.
@@ -958,6 +962,8 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
             user_initiated_only (e.g. podcasts/audiobooks, which have no user-initiated
             container).
         """
+        if userid:
+            check_acting_user(userid)
         if providers is not None and not providers:
             return []
         if media_types is None:
@@ -1085,14 +1091,18 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
             for db_row in db_rows
         ]
 
-    @api_command("music/recently_added_tracks", required_scope=Scope.LIBRARY_READ)
+    @api_command(
+        "music/recently_added_tracks", required_scope=Scope.LIBRARY_READ, allow_impersonation=True
+    )
     async def recently_added_tracks(self, limit: int = 10) -> list[Track]:
         """Return a list of the last added tracks."""
         return await self.tracks.library_items(
             limit=limit, order_by="timestamp_added_desc", summary=False
         )
 
-    @api_command("music/in_progress_items", required_scope=Scope.LIBRARY_READ)
+    @api_command(
+        "music/in_progress_items", required_scope=Scope.LIBRARY_READ, allow_impersonation=True
+    )
     async def in_progress_items(
         self, limit: int = 10, all_users: bool = False, providers: list[str] | None = None
     ) -> list[ItemMapping]:
@@ -1101,11 +1111,14 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
 
         :param limit: Maximum number of items to return.
         :param all_users: If True, include in-progress items across all users, not just
-            the current session's user.
+            the current session's user. Deprecated, use the user argument; needs the
+            users.impersonate scope.
         :param providers: Restrict results to items reachable through one of these provider
             instance ids (OR semantics). None applies no filter; an explicit empty list
             returns no items.
         """
+        if all_users:
+            check_acting_user(None)
         if providers is not None and not providers:
             return []
         available_providers = ("library", *self.get_active_provider_instances())
@@ -1252,7 +1265,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
             allow_update_metadata=allow_update_metadata,
         )
 
-    @api_command("music/sound_effects", required_scope=Scope.LIBRARY_READ)
+    @api_command("music/sound_effects", required_scope=Scope.LIBRARY_READ, allow_impersonation=True)
     async def sound_effects(self) -> list[SoundEffect]:
         """Return all sound effect items from providers supporting them."""
         providers = self._apply_user_provider_filter(
@@ -1939,7 +1952,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
             )
             await self.database.commit()
 
-    @api_command("music/track_by_name", required_scope=Scope.LIBRARY_READ)
+    @api_command("music/track_by_name", required_scope=Scope.LIBRARY_READ, allow_impersonation=True)
     async def get_track_by_name(
         self,
         track_name: str,

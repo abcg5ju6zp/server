@@ -176,16 +176,19 @@ class GenreController(MediaControllerBase[Genre]):
             "music/genres/overview",
             self.get_overview,
             required_scope=Scope.LIBRARY_READ,
+            allow_impersonation=True,
         )
         self.mass.register_api_command(
             "music/genres/tracks",
             self.tracks,
             required_scope=Scope.LIBRARY_READ,
+            allow_impersonation=True,
         )
         self.mass.register_api_command(
             "music/genres/albums",
             self.albums,
             required_scope=Scope.LIBRARY_READ,
+            allow_impersonation=True,
         )
         self.mass.register_api_command(
             "music/genres/scan_mappings",
@@ -196,16 +199,19 @@ class GenreController(MediaControllerBase[Genre]):
             "music/genres/scanner_status",
             self.get_scanner_status,
             required_scope=Scope.LIBRARY_READ,
+            allow_impersonation=True,
         )
         self.mass.register_api_command(
             "music/genres/genres_for_media_item",
             self.get_genres_for_media_item,
             required_scope=Scope.LIBRARY_READ,
+            allow_impersonation=True,
         )
         self.mass.register_api_command(
             "music/genres/genre_exclusions_for_media_item",
             self.get_genre_exclusions_for_media_item,
             required_scope=Scope.LIBRARY_READ,
+            allow_impersonation=True,
         )
         self.mass.register_api_command(
             "music/genres/exclude_genre_from_media_item",
@@ -226,11 +232,13 @@ class GenreController(MediaControllerBase[Genre]):
             "music/genres/media_counts",
             self.get_genre_media_counts,
             required_scope=Scope.LIBRARY_READ,
+            allow_impersonation=True,
         )
         self.mass.register_api_command(
             "music/genres/global_exclusions",
             self.get_global_genre_exclusions,
             required_scope=Scope.LIBRARY_READ,
+            allow_impersonation=True,
         )
         self.mass.register_api_command(
             "music/genres/remove_global_exclusion",

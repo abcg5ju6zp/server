@@ -41,6 +41,7 @@ from music_assistant.controllers.webserver.auth import (
 from music_assistant.controllers.webserver.controller import WebserverController
 from music_assistant.controllers.webserver.helpers.auth_middleware import (
     ImpersonatedUser,
+    check_acting_user,
     get_current_user,
     has_scope,
     resolve_command_impersonation,
@@ -3144,6 +3145,32 @@ async def test_resolve_command_impersonation_checks_the_target_scope(
     # the service caller holds library.write, the guest it acts for does not
     with pytest.raises(InsufficientPermissions, match="impersonated user lacks"):
         await resolve_command_impersonation(mass, {"user": "guest"}, Scope.LIBRARY_WRITE)
+
+
+def test_check_acting_user() -> None:
+    """A legacy user parameter may name another user (or every user) only with users.impersonate."""
+    member = User(user_id="member", username="member", role=UserRole.USER)
+    service = User(user_id="service", username="service", role=UserRole.SERVICE)
+
+    # a sync test runs in the root context, so leave it as it was found
+    try:
+        set_current_user(None)
+        check_acting_user("anyone")
+        set_current_user(member)
+        check_acting_user("member")
+        for acting_user in ("other", None):
+            with pytest.raises(InsufficientPermissions):
+                check_acting_user(acting_user)
+        set_current_user(service)
+        check_acting_user("other")
+        check_acting_user(None)
+        # the impersonated user is the one acting, so its own role decides
+        set_impersonated_user(member)
+        with pytest.raises(InsufficientPermissions):
+            check_acting_user("other")
+    finally:
+        set_impersonated_user(None)
+        set_current_user(None)
 
 
 def test_has_scope() -> None:

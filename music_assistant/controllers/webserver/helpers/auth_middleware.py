@@ -205,6 +205,24 @@ def has_scope(user: User, scope: Scope | tuple[Scope, ...]) -> bool:
     return scope in role_scopes
 
 
+def check_acting_user(acting_user_id: str | None) -> None:
+    """
+    Refuse acting for another user than the current one without the users.impersonate scope.
+
+    For the legacy parameters that name the user a command acts for (such as userid);
+    the user argument of impersonation-enabled commands replaces them.
+
+    :param acting_user_id: The user the command acts for, None for every user.
+    """
+    user = get_current_user()
+    if user is None or acting_user_id == user.user_id:
+        return
+    if not has_scope(user, Scope.USERS_IMPERSONATE):
+        raise InsufficientPermissions(
+            "The users.impersonate scope is required to act for another user."
+        )
+
+
 def custom_role_scopes(scopes: Iterable[Scope]) -> list[Scope]:
     """
     Return the sorted scopes a custom role holds when it is granted the given scopes.
