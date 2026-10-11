@@ -340,6 +340,7 @@ CONFIGURABLE_CORE_CONTROLLERS = (
     "cache",
     "music",
     "player_queues",
+    "player_commands",
     "tasks",
 )
 VERBOSE_LOG_LEVEL: Final[int] = 5

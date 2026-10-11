@@ -69,6 +69,9 @@ from music_assistant.controllers.diagnostics import DiagnosticsController
 from music_assistant.controllers.discovery import DiscoveryController
 from music_assistant.controllers.metadata import MetaDataController
 from music_assistant.controllers.music import MusicController
+from music_assistant.controllers.player_commands.controller import (
+    PlayerCommandsController,
+)
 from music_assistant.controllers.player_queues import PlayerQueuesController
 from music_assistant.controllers.players import PlayerController
 from music_assistant.controllers.storage import StorageController
@@ -227,6 +230,7 @@ class MusicAssistant:
     tasks: TasksController
     music: MusicController
     players: PlayerController
+    player_commands: PlayerCommandsController
     player_queues: PlayerQueuesController
     discovery: DiscoveryController
     streams: StreamsController
@@ -263,7 +267,7 @@ class MusicAssistant:
         self._http_session: ClientSession | None = None
         self._http_session_no_ssl: ClientSession | None = None
 
-    async def start(self) -> None:
+    async def start(self) -> None:  # noqa: PLR0915
         """Start running the Music Assistant server."""
         self.loop = asyncio.get_running_loop()
         # start() runs on the event loop thread, so this is the loop's thread id.
@@ -315,6 +319,7 @@ class MusicAssistant:
             tg.create_task(setup_controller(self.music))
             tg.create_task(setup_controller(self.metadata))
             tg.create_task(setup_controller(self.players))
+            tg.create_task(setup_controller(self.player_commands))
             tg.create_task(setup_controller(self.player_queues))
             tg.create_task(setup_controller(self.diagnostics))
             tg.create_task(setup_controller(self.dashboard))
@@ -327,6 +332,7 @@ class MusicAssistant:
             "music",
             "metadata",
             "players",
+            "player_commands",
             "player_queues",
         ):
             await cast("CoreController", getattr(self, controller_name)).post_setup()
@@ -375,8 +381,12 @@ class MusicAssistant:
         # the startup if they fail or take a long time to load
         if not self.safe_mode:
             await self._load_providers()
+        # providers are (re)loading in the background, but the configured set has been
+        # handed off: start the batch player commands post-startup grace window, after
+        # which targets whose player never appeared are sealed
+        await self.player_commands.on_providers_loaded()
         # at this point we are fully up and running,
-        # set state to running to signal we're ready
+        # set state to running to signal that we're ready
         self._set_state(CoreState.RUNNING)
 
     async def stop(self) -> None:
@@ -404,6 +414,7 @@ class MusicAssistant:
             "metadata",
             "music",
             "player_queues",
+            "player_commands",
             "players",
             "translations",
             "diagnostics",
@@ -1247,6 +1258,7 @@ class MusicAssistant:
             self.tasks,
             self.music,
             self.players,
+            self.player_commands,
             self.player_queues,
             self.translations,
             self.webserver,
@@ -1287,6 +1299,7 @@ class MusicAssistant:
         self.metadata = MetaDataController(self)
         self.music = MusicController(self)
         self.players = PlayerController(self)
+        self.player_commands = PlayerCommandsController(self)
         self.player_queues = PlayerQueuesController(self)
         self.streams = StreamsController(self)
         self.translations = TranslationController(self)

@@ -1713,6 +1713,11 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
 
             # now we're ready to signal the player is added and available
             player.set_initialized()
+            if pc_controller := getattr(self.mass, "player_commands", None):
+                # report availability to the batch commands reconciliation
+                pc_controller.notify_player_available(
+                    player_id, player.provider.instance_id, player.provider.domain
+                )
             self.logger.info(
                 "Player (type %s) registered: %s/%s",
                 player.state.type.value,
@@ -1759,9 +1764,12 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
                         existing, becomes_protocol=becomes_protocol
                     )
                 self._players[player.player_id] = player
-                if existing is not player:
+                replaced = existing is not player
+                if replaced:
                     # a fresh instance starts out with a base config only, so it needs
                     # the config the registration resolved before it can be used
+                    old_instance_id = existing.provider.instance_id
+                    old_provider_domain = existing.provider.domain
                     player.set_config(existing.config)
                     await player.on_config_updated()
                     if self._registration_aborted(player):
@@ -1775,6 +1783,14 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
                 self._save_underlying_player_id(player)
                 if role_changed:
                     await self._finish_player_type_transition(player)
+                if replaced and (
+                    pc_controller := getattr(self.mass, "player_commands", None)
+                ):
+                    # same player id, new object/identity: batch targets frozen on the
+                    # old provider instance must not silently land on this one
+                    pc_controller.notify_player_replaced(
+                        player.player_id, old_instance_id, old_provider_domain
+                    )
                 # Also schedule update when replacing existing player
                 self._schedule_update_all_players()
                 return
@@ -1828,6 +1844,10 @@ class PlayerController(AnnouncementsMixin, AudioSourceMixin, ProtocolLinkingMixi
         # so let the owning plugin release an upstream session pointing at us
         await self._release_audio_source(player_id)
         del self._players[player_id]
+        if pc_controller := getattr(self.mass, "player_commands", None):
+            # let the batch commands settle queued/in-flight targets for this player;
+            # a temporary absence is retried, a permanent removal terminates them
+            pc_controller.notify_player_gone(player_id, permanent)
         # clean up all lock entries for this player
         for prefix in [p.value for p in PlayerLockPurpose]:
             self._player_command_locks.pop(f"{prefix}_{player_id}", None)

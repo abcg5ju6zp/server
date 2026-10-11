@@ -56,6 +56,9 @@ from music_assistant.constants import (
     VERBOSE_LOG_LEVEL,
     WILDCARD_BIND_IPS,
 )
+from music_assistant.controllers.player_commands.errors import (
+    BatchOperationConflictError,
+)
 from music_assistant.controllers.webserver.helpers.ssl import (
     create_server_ssl_context,
     format_certificate_info,
@@ -820,6 +823,9 @@ class WebserverController(CoreController):
             return self._localized_json_response(result, locale)
         except InsufficientPermissions as e:
             return web.Response(status=403, text=str(e))
+        except BatchOperationConflictError as e:
+            # a reused operation id carrying a different payload is a client conflict
+            return web.Response(status=409, text=str(e))
         except (InvalidDataError, UserNotFoundError) as e:
             return web.Response(status=400, text=str(e))
         except PlayerUnavailableError as e:
