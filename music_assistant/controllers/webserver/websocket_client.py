@@ -36,7 +36,13 @@ from music_assistant_models.media_items.metadata import IMAGE_PROXY_ID_RESOLVER
 from music_assistant_models.translations import TRANSLATION_RESOLVER
 
 from music_assistant.constants import HOMEASSISTANT_SYSTEM_USER, VERBOSE_LOG_LEVEL
+from music_assistant.controllers.eventlog import ResumableSubscription, compute_scope_sig
+from music_assistant.controllers.eventlog.models import (
+    ResumeMode,
+    SequencedEventMessage,
+)
 from music_assistant.helpers.api import APICommandHandler, parse_arguments
+from music_assistant.helpers.json import get_serializable_value
 from music_assistant.helpers.provider_access import access_allows, with_derived_provider_filter
 from music_assistant.helpers.throttle_retry import RequestPriority, set_request_priority
 
@@ -59,6 +65,14 @@ if TYPE_CHECKING:
 
 MAX_PENDING_MSG = 512
 CANCELLATION_ERRORS: Final = (asyncio.CancelledError, futures.CancelledError)
+
+# connection-local commands for the resumable event stream (not registered as API
+# commands because they act on this connection's own subscription state)
+EVENT_STREAM_SUBSCRIBE: Final = "event_stream/subscribe"
+EVENT_STREAM_ACK: Final = "event_stream/ack"
+
+# anything the writer is allowed to serialize, including the resumable event envelope
+OutgoingMessage = MessageType | SequencedEventMessage
 
 
 class WebsocketClientHandler:
@@ -86,6 +100,10 @@ class WebsocketClientHandler:
         self._is_ingress = is_request_from_ingress(request)
         self._is_ingress_proxy = is_request_from_ingress_proxy(request)
         self._events_unsub_callback: Any = None  # Will be set after authentication
+        # opt-in for the cursor-based resumable event stream (set on the auth command)
+        self._event_stream_opt_in = False
+        # active resumable subscription (None for legacy clients)
+        self._event_sub: ResumableSubscription | None = None
         # uris of the personal playlists this client was told are gone
         self._hidden_playlists: set[str] = set()
         # Track WebRTC session ID if this is a WebRTC gateway connection
@@ -208,6 +226,13 @@ class WebsocketClientHandler:
 
         finally:
             # Handle connection shutting down.
+            if self._event_sub is not None:
+                # release the resumable subscription; its events stay in the global
+                # persistent window and can be replayed if the client reconnects
+                event_log = getattr(self.mass, "event_log", None)
+                if event_log is not None:
+                    event_log.unregister_listener(self._event_sub)
+                self._event_sub = None
             if self._events_unsub_callback:
                 self._events_unsub_callback()
                 self._logger.log(VERBOSE_LOG_LEVEL, "Unsubscribed from events")
@@ -246,6 +271,11 @@ class WebsocketClientHandler:
         # Handle special "translations/set_locale" command (updates connection state)
         if msg.command == "translations/set_locale":
             await self._handle_set_locale_command(msg)
+            return
+
+        # Handle special resumable event stream commands (act on this connection)
+        if msg.command in (EVENT_STREAM_SUBSCRIBE, EVENT_STREAM_ACK):
+            await self._handle_event_stream_command(msg)
             return
 
         # work out handler for the given path/command
@@ -370,7 +400,7 @@ class WebsocketClientHandler:
                 self._logger.log(VERBOSE_LOG_LEVEL, "Writing: %s", message)
                 await self.wsock.send_str(message)
 
-    async def _send_message(self, message: MessageType) -> None:
+    async def _send_message(self, message: OutgoingMessage) -> None:
         """
         Send a message to the client (for large response messages).
 
@@ -402,7 +432,7 @@ class WebsocketClientHandler:
 
             self.cancel()
 
-    def _send_message_sync(self, message: MessageType) -> None:
+    def _send_message_sync(self, message: OutgoingMessage) -> None:
         """
         Send a message from a sync context (for small messages like events).
 
@@ -483,6 +513,11 @@ class WebsocketClientHandler:
             self._locale = locale
             await self.mass.translations.ensure_locale_loaded(locale)
 
+        # A client may opt into the cursor-based resumable event stream; it opens it
+        # with an explicit event_stream/subscribe command instead of legacy autojoin
+        if msg.args and msg.args.get("event_stream"):
+            self._event_stream_opt_in = True
+
         # Send success response
         await self._send_message(
             SuccessResultMessage(
@@ -494,8 +529,9 @@ class WebsocketClientHandler:
             )
         )
 
-        # Subscribe to events after successful authentication
-        self._subscribe_to_events()
+        # Subscribe to events after successful authentication (legacy clients only)
+        if not self._event_stream_opt_in:
+            self._subscribe_to_events()
 
         # Register with webserver for tracking
         self.webserver.register_websocket_client(self)
@@ -551,115 +587,152 @@ class WebsocketClientHandler:
         return self._sendspin_player_is_private
 
     def _subscribe_to_events(self) -> None:
-        """Subscribe to Mass events and forward them to the client."""
+        """Subscribe to Mass events and forward them to the client (legacy mode)."""
         if self._events_unsub_callback is not None:
             # Already subscribed
             return
-
-        def handle_event(event: MassEvent) -> None:
-            # Latch the bound player's private status on every event, before applying the
-            # filter: the user may be unrestricted now and restricted later, and the flag
-            # must already be set so the owner still receives the player's removal event.
-            own_private_player = self._is_own_private_player(event.object_id)
-            # filter events for objects the user has no access to
-            player_filter = player_access_filter(self._authenticated_user)
-            if (
-                player_filter is not None
-                and event.event
-                in (
-                    EventType.PLAYER_ADDED,
-                    EventType.PLAYER_REMOVED,
-                    EventType.PLAYER_UPDATED,
-                    EventType.PLAYER_SLEEP_TIMER_UPDATED,
-                    EventType.QUEUE_ADDED,
-                    EventType.QUEUE_ITEMS_UPDATED,
-                    EventType.QUEUE_TIME_UPDATED,
-                    EventType.QUEUE_UPDATED,
-                )
-                and event.object_id
-                and event.object_id not in player_filter
-                # the private client player this connection announced is always allowed
-                and not own_private_player
-            ):
-                return
-
-            if event.event == EventType.SETUP_FLOW_UPDATED:
-                # setup flow steps carry prefilled values, OAuth urls and the
-                # flow_id guarding the unauthenticated callback route - only
-                # users who could interact with the flow may receive them
-                user = self._authenticated_user
-                if user is None:
-                    return
-                access = (
-                    self.mass.config.get_setup_flow_access(event.object_id)
-                    if event.object_id
-                    else None
-                )
-                if access is None:
-                    # flow already popped (terminal step race): the flow kind is no
-                    # longer known, so require both config scopes to be safe
-                    if not has_scope(user, Scope.CONFIG_PROVIDERS_WRITE) or not has_scope(
-                        user, Scope.CONFIG_PLAYERS_WRITE
-                    ):
-                        return
-                elif not access.allows(user):
-                    return
-
-            if isinstance(event.data, Playlist) and not self._forward_playlist_event(
-                event, event.data
-            ):
-                return
-
-            if isinstance(event.data, FavoriteUpdate) and (
-                self._authenticated_user is None
-                or event.data.user_id != self._authenticated_user.user_id
-            ):
-                # a like or dislike is the business of its own user only
-                return
-
-            if isinstance(event.data, MediaItem) and event.data.favorite is not None:
-                # a library item carries the favorite state of the user that touched it; every
-                # client keeps its own and learns of changes through the favorite event
-                event = MassEvent(
-                    event=event.event,
-                    object_id=event.object_id,
-                    data=replace(event.data, favorite=None),
-                )
-
-            if event.event == EventType.TASKS_UPDATED:
-                if self._authenticated_user is None:
-                    return
-                task_data = self.mass.tasks.list_tasks_for_user(self._authenticated_user)
-                self._send_message_sync(
-                    MassEvent(
-                        event=event.event,
-                        object_id=event.object_id,
-                        data=task_data,
-                    )
-                )
-                return
-
-            if event.event == EventType.PROVIDERS_UPDATED:
-                # the payload is signalled unfiltered, so narrow it down to the
-                # music sources this client's user may see
-                if self._authenticated_user is None:
-                    return
-                provider_data = self.mass.get_providers_for_user(self._authenticated_user)
-                self._send_message_sync(
-                    MassEvent(
-                        event=event.event,
-                        object_id=event.object_id,
-                        data=provider_data,
-                    )
-                )
-                return
-
-            self._send_message_sync(event)
-
-        self._events_unsub_callback = self.mass.subscribe(handle_event)
+        self._events_unsub_callback = self.mass.subscribe(
+            lambda event: self._dispatch_event(event, None)
+        )
         self._logger.debug("Subscribed to events")
 
-    def _forward_playlist_event(self, event: MassEvent, playlist: Playlist) -> bool:
+    def _forward(self, seq: int | None, event: MassEvent) -> None:
+        """
+        Send one (possibly rewritten) event to the client.
+
+        Legacy connections (seq is None) receive the bare MassEvent exactly as before.
+        Resumable connections receive the same payload wrapped with its cursor.
+
+        :param seq: The event log sequence, or None for a legacy connection.
+        :param event: The event to forward.
+        """
+        if seq is None:
+            self._send_message_sync(event)
+            return
+        self._send_message_sync(
+            SequencedEventMessage(
+                event=event.event,
+                object_id=event.object_id,
+                data=event.data,
+                seq=seq,
+                server_id=self.mass.server_id,
+            )
+        )
+
+    def _dispatch_event(self, event: MassEvent, seq: int | None) -> None:
+        """
+        Apply this connection's permission filter to one event and forward it.
+
+        This is the single delivery entry point for both the legacy live subscription
+        and the resumable stream (live delivery and replay after a reconnect), so the
+        filtering and ordering are identical on both paths. Every branch that rewrites
+        the payload keeps the same sequence: one cursor yields at most one message.
+
+        :param event: The event to filter.
+        :param seq: The event log sequence for a resumable connection, else None.
+        """
+        # Latch the bound player's private status on every event, before applying the
+        # filter: the user may be unrestricted now and restricted later, and the flag
+        # must already be set so the owner still receives the player's removal event.
+        own_private_player = self._is_own_private_player(event.object_id)
+        # filter events for objects the user has no access to
+        player_filter = player_access_filter(self._authenticated_user)
+        if (
+            player_filter is not None
+            and event.event
+            in (
+                EventType.PLAYER_ADDED,
+                EventType.PLAYER_REMOVED,
+                EventType.PLAYER_UPDATED,
+                EventType.PLAYER_SLEEP_TIMER_UPDATED,
+                EventType.QUEUE_ADDED,
+                EventType.QUEUE_ITEMS_UPDATED,
+                EventType.QUEUE_TIME_UPDATED,
+                EventType.QUEUE_UPDATED,
+            )
+            and event.object_id
+            and event.object_id not in player_filter
+            # the private client player this connection announced is always allowed
+            and not own_private_player
+        ):
+            return
+
+        if event.event == EventType.SETUP_FLOW_UPDATED:
+            # setup flow steps carry prefilled values, OAuth urls and the
+            # flow_id guarding the unauthenticated callback route - only
+            # users who could interact with the flow may receive them
+            user = self._authenticated_user
+            if user is None:
+                return
+            access = (
+                self.mass.config.get_setup_flow_access(event.object_id) if event.object_id else None
+            )
+            if access is None:
+                # flow already popped (terminal step race): the flow kind is no
+                # longer known, so require both config scopes to be safe
+                if not has_scope(user, Scope.CONFIG_PROVIDERS_WRITE) or not has_scope(
+                    user, Scope.CONFIG_PLAYERS_WRITE
+                ):
+                    return
+            elif not access.allows(user):
+                return
+
+        if isinstance(event.data, Playlist) and not self._forward_playlist_event(
+            seq, event, event.data
+        ):
+            return
+
+        if isinstance(event.data, FavoriteUpdate) and (
+            self._authenticated_user is None
+            or event.data.user_id != self._authenticated_user.user_id
+        ):
+            # a like or dislike is the business of its own user only
+            return
+
+        if isinstance(event.data, MediaItem) and event.data.favorite is not None:
+            # a library item carries the favorite state of the user that touched it; every
+            # client keeps its own and learns of changes through the favorite event
+            event = MassEvent(
+                event=event.event,
+                object_id=event.object_id,
+                data=replace(event.data, favorite=None),
+            )
+
+        if event.event == EventType.TASKS_UPDATED:
+            if self._authenticated_user is None:
+                return
+            task_data = self.mass.tasks.list_tasks_for_user(self._authenticated_user)
+            self._forward(
+                seq,
+                MassEvent(
+                    event=event.event,
+                    object_id=event.object_id,
+                    data=task_data,
+                ),
+            )
+            return
+
+        if event.event == EventType.PROVIDERS_UPDATED:
+            # the payload is signalled unfiltered, so narrow it down to the
+            # music sources this client's user may see
+            if self._authenticated_user is None:
+                return
+            provider_data = self.mass.get_providers_for_user(self._authenticated_user)
+            self._forward(
+                seq,
+                MassEvent(
+                    event=event.event,
+                    object_id=event.object_id,
+                    data=provider_data,
+                ),
+            )
+            return
+
+        self._forward(seq, event)
+
+    def _forward_playlist_event(
+        self, seq: int | None, event: MassEvent, playlist: Playlist
+    ) -> bool:
         """
         Return whether an event about a playlist may reach this client as it was signalled.
 
@@ -667,6 +740,7 @@ class WebsocketClientHandler:
         user may no longer see it is instead told once that the playlist is gone, so it
         drops the row it may still hold.
 
+        :param seq: The event log sequence for a resumable connection, else None.
         :param event: The event about the playlist.
         :param playlist: The playlist the event carries.
         """
@@ -681,5 +755,258 @@ class WebsocketClientHandler:
         # only an update can take a playlist away from a client that still holds it; one
         # created or removed out of sight was never held, nor is anything held before login
         if event.event == EventType.MEDIA_ITEM_UPDATED and self._authenticated_user:
-            self._send_message_sync(MassEvent(event=EventType.MEDIA_ITEM_DELETED, object_id=uri))
+            self._forward(seq, MassEvent(event=EventType.MEDIA_ITEM_DELETED, object_id=uri))
         return False
+
+    def _deliver_event_record(self, subscription: ResumableSubscription, record: Any) -> None:
+        """
+        Deliver one event log record on a resumable connection, advancing its watermark.
+
+        Records must arrive contiguously: a gap means this connection can no longer patch
+        its state and has to reopen the stream (the client then gets a fresh snapshot).
+
+        :param subscription: The connection's resumable subscription.
+        :param record: The event log record to deliver.
+        """
+        if subscription is not self._event_sub:
+            return
+        if record.seq != subscription.sent_watermark + 1:
+            self._logger.error(
+                "Event stream gap on connection %s (expected %s, got %s); "
+                "closing for a fresh subscription",
+                self.client_id,
+                subscription.sent_watermark + 1,
+                record.seq,
+            )
+            self.cancel()
+            return
+        event = self.mass.event_log.rehydrate_record(record)
+        self._dispatch_event(event, record.seq)
+        subscription.sent_watermark = record.seq
+
+    def _arm_subscription(self, subscription: ResumableSubscription, head: int) -> None:
+        """
+        Switch a freshly validated subscription from buffering to live delivery.
+
+        Buffered records newer than the snapshot/replay watermark are drained here, after
+        the response was enqueued, so the wire order is response -> replay -> live events.
+
+        :param subscription: The connection's resumable subscription.
+        :param head: Sequence captured together with listener registration.
+        """
+        subscription.buffering = False
+        buffered = subscription.buffer
+        while buffered:
+            record = buffered.popleft()
+            if record.seq <= head:
+                # defensive: registration and head capture are one atomic step
+                continue
+            self._deliver_event_record(subscription, record)
+
+    async def _handle_event_stream_command(self, msg: CommandMessage) -> None:
+        """
+        Auth-gate and dispatch an event_stream command with connection identity set.
+
+        :param msg: The incoming command message.
+        """
+        if self._authenticated_user is None:
+            await self._send_message(
+                ErrorResultMessage(
+                    msg.message_id,
+                    AuthenticationRequired.error_code,
+                    "Authentication required. Please send auth command first.",
+                    translation_key="authentication_required",
+                )
+            )
+            return
+        if not self._event_stream_opt_in:
+            await self._send_message(
+                ErrorResultMessage(
+                    msg.message_id,
+                    InvalidCommand.error_code,
+                    "Resumable event stream was not requested at authentication",
+                    translation_key="invalid_command",
+                )
+            )
+            return
+        # Put this connection's identity in context for snapshot gathering; impersonation
+        # is intentionally ignored so a snapshot never widens beyond the authenticated user
+        set_current_client_id(self.client_id)
+        set_current_user(self._authenticated_user)
+        set_current_token(self._current_token)
+        set_sendspin_player_id(self._sendspin_player_id)
+        set_request_priority(RequestPriority.NORMAL)
+        coro = (
+            self._event_stream_subscribe(msg)
+            if msg.command == EVENT_STREAM_SUBSCRIBE
+            else self._event_stream_ack(msg)
+        )
+        self.mass.create_task(coro)
+
+    async def _event_stream_subscribe(self, msg: CommandMessage) -> None:
+        """
+        Open/reopen the resumable event stream for this connection.
+
+        A valid cursor replays the stored events; anything else serves an atomic snapshot
+        at the captured watermark and replays everything admitted afterwards.
+
+        :param msg: The subscribe command, optionally carrying token/seq/server_id.
+        """
+        args = msg.args or {}
+        event_log = self.mass.event_log
+        user = self._authenticated_user
+        assert user is not None
+        if self._event_sub is not None:
+            await self._send_message(
+                ErrorResultMessage(
+                    msg.message_id,
+                    InvalidCommand.error_code,
+                    "Event stream already subscribed on this connection",
+                    translation_key="invalid_command",
+                )
+            )
+            return
+        subscription = ResumableSubscription(client=self)
+        self._event_sub = subscription
+        # register before the first await: every later event lands in the buffer
+        head = event_log.register_listener(subscription)
+        try:
+            scope_sig = compute_scope_sig(user)
+            mode, reason = await event_log.validate_resume(
+                args.get("token"),
+                args.get("seq"),
+                args.get("server_id"),
+                user,
+                scope_sig,
+                head,
+            )
+            replay_records: list[Any] = []
+            snapshot = None
+            if mode is ResumeMode.RESUMED:
+                subscription.sent_watermark = int(args["seq"])
+                replay_records = event_log.iter_window(int(args["seq"]))
+            else:
+                snapshot = await self._build_event_snapshot()
+                subscription.sent_watermark = head
+            # rotate the single-use resume token
+            token = await event_log.create_subscription(user, scope_sig)
+            subscription.token = token
+            subscription.user_id = user.user_id
+            subscription.scope_sig = scope_sig
+            # the response must be enqueued before any replayed/live event
+            await self._send_message(
+                SuccessResultMessage(
+                    msg.message_id,
+                    {
+                        "mode": mode.value,
+                        "reason": reason.value,
+                        "server_id": self.mass.server_id,
+                        "cursor": head,
+                        "token": token,
+                        "snapshot": snapshot,
+                    },
+                )
+            )
+            for record in replay_records:
+                self._deliver_event_record(subscription, record)
+            self._arm_subscription(subscription, head)
+        except MusicAssistantError as err:
+            self._logger.warning("%s: %s", msg.command, err)
+            event_log.unregister_listener(subscription)
+            self._event_sub = None
+            await self._send_message(
+                ErrorResultMessage(
+                    msg.message_id,
+                    err.error_code,
+                    str(err) or err.__class__.__name__,
+                    translation_key=err.translation_key,
+                )
+            )
+        except Exception as err:
+            self._logger.exception("Error handling event stream subscribe")
+            event_log.unregister_listener(subscription)
+            self._event_sub = None
+            await self._send_message(
+                ErrorResultMessage(msg.message_id, getattr(err, "error_code", 999), str(err))
+            )
+
+    async def _event_stream_ack(self, msg: CommandMessage) -> None:
+        """
+        Advance this connection's acknowledgement watermark.
+
+        Only the contiguous cursor actually delivered to this connection can advance it:
+        future/gapped acks are clamped, lower/duplicate acks are a no-op. The ack never
+        reclaims the window on its own - the global floor across all active connections
+        does - so acknowledging events invisible to other users is harmless.
+
+        :param msg: The ack command carrying the last processed cursor.
+        """
+        subscription = self._event_sub
+        args = msg.args or {}
+        if (
+            subscription is None
+            or subscription.token is None
+            or not isinstance(args.get("seq"), int)
+            or isinstance(args.get("seq"), bool)
+        ):
+            await self._send_message(
+                ErrorResultMessage(
+                    msg.message_id,
+                    InvalidCommand.error_code,
+                    "No active resumable event stream or invalid seq argument",
+                    translation_key="invalid_command",
+                )
+            )
+            return
+        watermark = max(
+            subscription.acked_watermark,
+            min(int(args["seq"]), subscription.sent_watermark),
+        )
+        subscription.acked_watermark = watermark
+        await self.mass.event_log.update_ack(subscription.token, watermark)
+        await self._send_message(
+            SuccessResultMessage(
+                msg.message_id,
+                {
+                    "acked": watermark,
+                    "server_id": self.mass.server_id,
+                    "cursor": watermark,
+                },
+            )
+        )
+
+    async def _build_event_snapshot(self) -> dict[str, Any]:
+        """
+        Gather the user-scoped runtime state a fresh client needs, as of the watermark.
+
+        Players honor the current user context; queues are filtered with the same player
+        access rule the event filter uses (queue/all itself is unfiltered). Events newer
+        than the snapshot watermark are replayed by the caller, so patching this snapshot
+        with them leaves no gap.
+        """
+        user = self._authenticated_user
+        assert user is not None
+        players = self.mass.players.all_player_states()
+        queues: list[Any] = []
+        queue_items: dict[str, list[Any]] = {}
+        player_filter = player_access_filter(user)
+        for queue in self.mass.player_queues:
+            if (
+                player_filter is not None
+                and queue.queue_id not in player_filter
+                and not self._is_own_private_player(queue.queue_id)
+            ):
+                continue
+            queues.append(queue)
+            queue_items[queue.queue_id] = self.mass.player_queues.items(queue.queue_id)
+        # pre-serialize the model-bearing values: SuccessResultMessage serializes its
+        # result field with get_serializable_value, which does not recurse into dicts
+        return {
+            "players": get_serializable_value(players),
+            "queues": get_serializable_value(queues),
+            "queue_items": {
+                queue_id: get_serializable_value(items) for queue_id, items in queue_items.items()
+            },
+            "providers": get_serializable_value(self.mass.get_providers_for_user(user)),
+            "tasks": get_serializable_value(self.mass.tasks.list_tasks_for_user(user)),
+        }

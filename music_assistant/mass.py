@@ -67,6 +67,7 @@ from music_assistant.controllers.config.retired_local_audio import (
 from music_assistant.controllers.dashboard import DashboardController
 from music_assistant.controllers.diagnostics import DiagnosticsController
 from music_assistant.controllers.discovery import DiscoveryController
+from music_assistant.controllers.eventlog import EventLogController
 from music_assistant.controllers.metadata import MetaDataController
 from music_assistant.controllers.music import MusicController
 from music_assistant.controllers.player_queues import PlayerQueuesController
@@ -309,8 +310,8 @@ class MusicAssistant:
         await setup_controller(self.translations)
 
         async with asyncio.TaskGroup() as tg:
-            tg.create_task(setup_controller(self.cache))
-            tg.create_task(setup_controller(self.tasks))
+            for controller in (self.cache, self.event_log, self.tasks):
+                tg.create_task(setup_controller(controller))
             tg.create_task(setup_controller(self.streams))
             tg.create_task(setup_controller(self.music))
             tg.create_task(setup_controller(self.metadata))
@@ -400,6 +401,7 @@ class MusicAssistant:
             "discovery",
             "streams",
             "webserver",
+            "event_log",
             "tasks",
             "metadata",
             "music",
@@ -722,6 +724,11 @@ class MusicAssistant:
             LOGGER.getChild("event").log(VERBOSE_LOG_LEVEL, "%s %s", event.value, object_id or "")
 
         event_obj = MassEvent(event=event, object_id=object_id, data=data)
+        # freeze/sequence the event in the persistent window before any broadcast, so
+        # live delivery and replay after a reconnect share one immutable record. The
+        # event log is absent in minimal test setups and stays a no-op there.
+        if event_log := getattr(self, "event_log", None):
+            event_log.admit(event_obj)
         for cb_func, event_filter, id_filter, is_coro in list(self._subscribers):
             if not (event_filter is None or event in event_filter):
                 continue
@@ -1282,6 +1289,7 @@ class MusicAssistant:
     async def _load_core_controllers(self) -> None:
         """Instantiate the core controllers and register their manifests and icons."""
         self.cache = CacheController(self)
+        self.event_log = EventLogController(self)
         self.tasks = TasksController(self)
         self.webserver = WebserverController(self)
         self.metadata = MetaDataController(self)
