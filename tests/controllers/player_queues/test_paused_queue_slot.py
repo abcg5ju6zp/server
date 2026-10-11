@@ -127,6 +127,8 @@ class _Rig:
         self.audio = StreamsAudio(mass)
         self.audio._get_media_stream = _endless_source  # type: ignore[method-assign]
         mass.streams.audio = self.audio
+        mass.streams.transcode_sessions.terminate_queue_sessions = AsyncMock()
+        mass.streams.transcode_sessions.terminate_for_item = AsyncMock()
 
     def add_queue(self, queue_id: str, state: PlaybackState) -> QueueItem:
         """Register a queue and its player in the given state, holding one item."""

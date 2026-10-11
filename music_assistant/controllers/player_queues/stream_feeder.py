@@ -387,6 +387,12 @@ class StreamFeederMixin(_PlayerQueuesBase):
         for idx, item in enumerate(queue_items):
             if idx > cleanup_threshold:
                 break  # No need to check further
+            # release resumable transcode sessions of the swept item first, so
+            # their encode chains stop reading a buffer that is about to clear
+            if item.streamdetails:
+                await self.mass.streams.transcode_sessions.terminate_for_item(
+                    queue_id, item.queue_item_id
+                )
             if (streamdetails := item.streamdetails) and (buffer := streamdetails.buffer):
                 self.logger.log(
                     VERBOSE_LOG_LEVEL,
@@ -422,6 +428,12 @@ class StreamFeederMixin(_PlayerQueuesBase):
             what sessions that ended earlier left behind. None clears every buffer.
         """
         self.mass.streams.audio.clear_crossfade_handover(queue_id)
+        # stop resumable transcode sessions before their PCM buffers are released.
+        # The session id scoping mirrors the buffer loop below: None clears all of
+        # the queue's sessions, a given id only that stopped playback session's.
+        await self.mass.streams.transcode_sessions.terminate_queue_sessions(
+            queue_id, session_id
+        )
 
         queue_data = self._queue_data.get(queue_id)
         queue_items = queue_data.items if queue_data else []

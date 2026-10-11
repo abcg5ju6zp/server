@@ -61,6 +61,8 @@ def _controller(items: list[QueueItem], playing: str | None = None) -> PlayerQue
         QUEUE_ID: PlayerQueueData(queue=MagicMock(), items=items, session_id=playing)
     }
     ctrl.mass = MagicMock()
+    ctrl.mass.streams.transcode_sessions.terminate_queue_sessions = AsyncMock()
+    ctrl.mass.streams.transcode_sessions.terminate_for_item = AsyncMock()
     return ctrl
 
 
@@ -198,3 +200,26 @@ async def test_a_pending_crossfade_handover_is_always_dropped() -> None:
 
     clear_crossfade_handover = cast("MagicMock", ctrl.mass.streams.audio.clear_crossfade_handover)
     clear_crossfade_handover.assert_called_once_with(QUEUE_ID)
+
+
+async def test_a_stop_terminates_resumable_sessions_of_the_stopped_session() -> None:
+    """Resumable transcode sessions are torn down before buffers are released."""
+    ctrl = _controller([_item("a", "sess-1"), _item("b", "sess-2")], playing="sess-2")
+
+    await ctrl._cleanup_queue_audio_data(QUEUE_ID, "sess-1")
+
+    terminate_sessions = cast(
+        "AsyncMock", ctrl.mass.streams.transcode_sessions.terminate_queue_sessions
+    )
+    terminate_sessions.assert_awaited_once_with(QUEUE_ID, "sess-1")
+
+
+async def test_a_full_clear_terminates_all_queue_sessions() -> None:
+    """A clear without a session id releases every session of the queue."""
+    ctrl = _controller([_item("a", "sess-1"), _item("b", "sess-2")])
+
+    await ctrl._cleanup_queue_audio_data(QUEUE_ID)
+
+    cast(
+        "AsyncMock", ctrl.mass.streams.transcode_sessions.terminate_queue_sessions
+    ).assert_awaited_once_with(QUEUE_ID, None)

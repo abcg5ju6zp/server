@@ -145,6 +145,8 @@ def _controller(**queue_kwargs: Any) -> Any:
     ctrl = PlayerQueuesController.__new__(PlayerQueuesController)
     ctrl.logger = Mock()
     ctrl.mass = MagicMock()
+    ctrl.mass.streams.transcode_sessions.terminate_queue_sessions = AsyncMock()
+    ctrl.mass.streams.transcode_sessions.terminate_for_item = AsyncMock()
     ctrl.mass.players.get_player = Mock(return_value=Mock(extra_data={}))
     lock_cm = MagicMock()
     lock_cm.__aenter__ = AsyncMock(return_value=None)

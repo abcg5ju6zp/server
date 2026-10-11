@@ -99,6 +99,12 @@ from music_assistant.controllers.streams.live_announcements import (
     LIVE_ANNOUNCEMENT_STREAM_PATH,
     LiveAnnouncementManager,
 )
+from music_assistant.controllers.streams.transcode_sessions import (
+    ResumeOutcome,
+    SessionHooks,
+    SessionKey,
+    TranscodeSessionManager,
+)
 from music_assistant.helpers.api import api_command
 from music_assistant.helpers.audio import (
     calculate_content_length,
@@ -266,6 +272,7 @@ class StreamsController(CoreController):
         self._network_fingerprint: tuple[str, str, int, tuple[str, ...]] | None = None
         self.audio = StreamsAudio(mass)
         self.audio_processing = AudioProcessingManager(mass)
+        self.transcode_sessions = TranscodeSessionManager(mass)
         self._audio_analysis = AudioAnalysisController(self)
         # Open per-item responses by queue, so a session rotation can abort the
         # stale ones: some players (Sonos) sit out their old stream before they
@@ -296,6 +303,7 @@ class StreamsController(CoreController):
             "active_announcements": self.announcement_renderer.active_announcements,
             "active_announcement_renders": self.announcement_renderer.active_renders,
             "active_live_announcements": self.live_announcements.active_sessions,
+            "resumable_transcode_sessions": self.transcode_sessions.diagnostics(),
             "publish_ip_configured": self._configured_publish_ip is not None,
         }
 
@@ -609,6 +617,7 @@ class StreamsController(CoreController):
 
     async def close(self) -> None:
         """Cleanup on exit."""
+        await self.transcode_sessions.close()
         await self._audio_analysis.close()
         await self.live_announcements.close()
         await self._server.close()
@@ -882,6 +891,22 @@ class StreamsController(CoreController):
                 source_bit_depth=queue_item.streamdetails.audio_format.bit_depth,
             )
 
+            # resumable sessions keep the output encode alive across a brief
+            # disconnect; everything ineligible (flow/radio/live/crossfade/...)
+            # keeps using the direct, single-connection streaming path below
+            resume_eligible = TranscodeSessionManager.is_eligible(
+                method=request.method,
+                media_type=queue_item.media_type,
+                duration=queue_item.duration,
+                allow_seek=queue_item.streamdetails.allow_seek,
+                is_realtime=queue_item.streamdetails.is_realtime,
+                crossfade_mode=crossfade_mode,
+                overlay_is_active=overlay_active(queue),
+                playback_speed=cast(
+                    "float", queue_item.extra_attributes.get("playback_speed", 1.0)
+                ),
+                content_type=output_format.content_type,
+            )
             # prepare request, add some DLNA/UPNP compatible headers
             # icy-name is sanitized (all control chars, not just newlines) to avoid a
             # "Potential header injection attack" ValueError by aiohttp
@@ -893,12 +918,17 @@ class StreamsController(CoreController):
                 if queue_item.media_type != MediaType.TRACK
                 else DLNA_CONTENT_FEATURES
             )
+            if resume_eligible:
+                # advertise byte-seek capability so reconnects arrive as Range requests
+                dlna_features = dlna_features.replace("DLNA.ORG_OP=00", "DLNA.ORG_OP=01")
             headers = {
                 **DEFAULT_STREAM_HEADERS,
                 "icy-name": sanitize_http_header_value(queue_item.name),
                 "contentFeatures.dlna.org": dlna_features,
                 "Content-Type": get_mime_type(output_format.output_format_str),
             }
+            if resume_eligible:
+                headers["Accept-Ranges"] = "bytes"
 
             resp = web.StreamResponse(status=200, reason="OK", headers=headers)
             resp.content_type = get_mime_type(output_format.output_format_str)
@@ -922,11 +952,26 @@ class StreamsController(CoreController):
             # the awaited setup above must not hand the player a stale track after all
             self._raise_if_stale_item_request(player, queue_id, queue_item)
 
-            await resp.prepare(request)
-
             # return early if this is not a GET request
             if request.method != "GET":
+                await resp.prepare(request)
                 return resp
+
+            if resume_eligible:
+                # builds and prepares its own (possibly 206) response
+                return await self._serve_resumable_item_stream(
+                    request=request,
+                    queue=queue,
+                    queue_item=queue_item,
+                    player=player,
+                    pcm_format=pcm_format,
+                    output_format=output_format,
+                    session_id=session_id,
+                    http_profile=http_profile,
+                    base_headers=headers,
+                )
+
+            await resp.prepare(request)
 
             self._update_audio_processing_context(
                 queue=queue,
@@ -1141,6 +1186,177 @@ class StreamsController(CoreController):
                         queue_id,
                         exc_info=True,
                     )
+
+    async def _serve_resumable_item_stream(  # noqa: PLR0915
+        self,
+        *,
+        request: web.Request,
+        queue: PlayerQueue,
+        queue_item: QueueItem,
+        player: Player,
+        pcm_format: AudioFormat,
+        output_format: AudioFormat,
+        session_id: str,
+        http_profile: str,
+        base_headers: dict[str, str],
+    ) -> web.StreamResponse:
+        """
+        Serve a finite seekable single through a resumable transcode session.
+
+        :param request: The incoming stream request.
+        :param queue: The queue owning the item.
+        :param queue_item: The queue item being streamed.
+        :param player: The player the stream is rendered for.
+        :param pcm_format: The PCM format fed into the final encoder.
+        :param output_format: The encoded output format.
+        :param session_id: The owning queue playback session id.
+        :param http_profile: The player's HTTP response profile.
+        :param base_headers: Prepared common stream headers.
+        """
+        queue_id = queue.queue_id
+        streamdetails = queue_item.streamdetails
+        assert streamdetails is not None
+
+        output_plan = self.audio.get_player_output_plan(
+            player_id=player.player_id,
+            input_format=pcm_format,
+            output_format=output_format,
+            shared_player_ids=player.state.group_members,
+            queue_id=queue_id,
+            session_id=session_id,
+            queue_item_id=queue_item.queue_item_id,
+        )
+        filter_params = output_plan.filter_params
+        duration_s = float(queue_item.duration) if queue_item.duration else None
+        total_bytes_hint: int | None = None
+        if http_profile == "forced_content_length" and duration_s:
+            seek_pos = streamdetails.seek_position or 0
+            total_bytes_hint = await get_content_length(
+                self.mass,
+                queue_item.uri,
+                output_format,
+                max(duration_s - seek_pos, 1),
+            )
+
+        context_initialised = False
+
+        def make_chain(start_media_ms: int) -> AsyncGenerator[bytes]:
+            # the processing context and the encode chain are built once per
+            # session generation, not once per HTTP connection
+            nonlocal context_initialised
+            if not context_initialised:
+                context_initialised = True
+                self._update_audio_processing_context(
+                    queue=queue,
+                    queue_item=queue_item,
+                    pcm_format=pcm_format,
+                    overlay_enabled=False,
+                    session_id=session_id,
+                )
+            audio_input = self.audio.get_queue_item_stream(
+                queue_item=queue_item,
+                pcm_format=pcm_format,
+                seek_position=start_media_ms / 1000,
+                playback_speed=1.0,
+                session_id=session_id,
+            )
+            return get_ffmpeg_stream(
+                audio_input=audio_input,
+                input_format=pcm_format,
+                output_format=output_format,
+                filter_params=filter_params,
+                extra_input_args=output_pacing_args(PacingProfile.DEFAULT),
+            )
+
+        async def _store_content_length(bytes_sent: int, seconds_streamed: float) -> None:
+            await store_content_length_in_cache(
+                self.mass,
+                queue_item.uri,
+                output_format,
+                bytes_sent,
+                seconds_streamed,
+            )
+
+        hooks = SessionHooks(
+            is_current=lambda: (
+                self.mass.player_queues.queue_data(queue_id).session_id == session_id
+            ),
+            on_first_bytes=lambda: self.mass.player_queues.track_loaded_in_buffer(
+                queue_id, queue_item.queue_item_id
+            ),
+            on_completed=_store_content_length,
+        )
+        key = SessionKey(
+            queue_session_id=session_id,
+            queue_id=queue_id,
+            queue_item_id=queue_item.queue_item_id,
+            player_id=player.player_id,
+            fmt=request.match_info["fmt"],
+        )
+        result = await self.transcode_sessions.resolve(
+            key=key,
+            queue_item=queue_item,
+            streamdetails=streamdetails,
+            buffer=streamdetails.buffer,
+            pcm_format=pcm_format,
+            output_format=output_format,
+            filter_params=filter_params,
+            http_profile=http_profile,
+            request=request,
+            duration_s=duration_s,
+            total_bytes_hint=total_bytes_hint,
+            make_chain=make_chain,
+            hooks=hooks,
+        )
+        # a session rotation landing during resolution must not be served
+        if self.mass.player_queues.queue_data(queue_id).session_id != session_id:
+            raise web.HTTPNotFound(reason=f"Unknown (or invalid) session: {session_id}")
+        self._raise_if_stale_item_request(player, queue_id, queue_item)
+
+        session = result.session
+        assert session is not None
+        status = 206 if result.outcome == ResumeOutcome.CONTINUED else 200
+        response_headers = {**base_headers, **result.headers}
+        resp = web.StreamResponse(status=status, reason="OK", headers=response_headers)
+        resp.content_type = get_mime_type(output_format.output_format_str)
+        if http_profile == "forced_content_length":
+            if result.total_bytes is not None:
+                resp.content_length = max(
+                    result.total_bytes - result.content_offset, 0
+                )
+        elif http_profile == "chunked":
+            resp.enable_chunked_encoding()
+
+        await resp.prepare(request)
+
+        if result.outcome == ResumeOutcome.COMPLETE:
+            # the item already reached its end before; nothing left to send
+            return resp
+
+        consumer = session.attach(request)
+        self._active_output_streams += 1
+        session_failed = False
+        try:
+            await session.pump(
+                consumer,
+                resp,
+                start_seq=result.start_seq,
+                replay_head=result.replay_head,
+            )
+            session_failed = session.state.value == "failed"
+        finally:
+            self._active_output_streams -= 1
+        if session_failed:
+            self.logger.error(
+                "Resumable stream for %s (%s) to %s failed: %s",
+                queue_item.name,
+                queue_item.uri,
+                queue.display_name,
+                session.error,
+            )
+            # the body stops short of what was announced: force the connection closed
+            resp.force_close()
+        return resp
 
     async def serve_audio_source_stream(self, request: web.Request) -> web.StreamResponse:
         """Stream a live AudioSource playing on a player."""

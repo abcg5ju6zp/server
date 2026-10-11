@@ -181,6 +181,36 @@ STREAM_SLOT_MATCH_TIMEOUT: Final[float] = 5.0
 # Beyond this, the stream is re-fetched at the seek position.
 SEEK_WAIT_THRESHOLD: Final[int] = 20
 
+# -- Resumable transcode sessions ------------------------------------------
+# A resumable session keeps the final encode chain alive after its client
+# disconnected, holding a bounded window of frame-aligned encoded segments in
+# memory. Everything here is in-process only: a server restart leaves no
+# session, so a reconnect is answered as a fresh stream. Encoded provider
+# audio must never be written to disk (see the project Usage Policy).
+
+# Seconds a session with no consumers waits for a reconnect before its
+# producer, transcode process and provider stream slot are all released.
+RESUME_LEASE_SECONDS: Final[float] = 120
+# Retained segment window, bounded by both duration and payload bytes.
+RESUME_RING_SECONDS: Final[float] = 30
+RESUME_RING_MAX_BYTES_LOSSY: Final[int] = 8 * 1024**2
+RESUME_RING_MAX_BYTES_FLAC: Final[int] = 32 * 1024**2
+RESUME_RING_MAX_BYTES_PCM: Final[int] = 24 * 1024**2
+# Conservative media-time overlap replayed on a Range-less reconnect, on top
+# of the segment boundary alignment. Covers data between the last drained
+# socket and what the client actually rendered.
+RESUME_SAFETY_REPLAY_MS: Final[int] = 500
+# Per-session and global caps. Global eviction only ever reaps sessions that
+# wait for a resume, never one with an attached consumer.
+RESUME_MAX_SESSIONS: Final[int] = 8
+RESUME_TOTAL_MAX_BYTES: Final[int] = 128 * 1024**2
+# Encoded frames arriving in one ffmpeg chunk are packed together; above this
+# payload the segment is split at the next frame boundary.
+RESUME_SEGMENT_MAX_PACK_BYTES: Final[int] = 256 * 1024
+# A session whose slow consumer blocks eviction past this multiple of the ring
+# byte cap has that consumer's transport aborted.
+RESUME_SLOW_CONSUMER_ABORT_FACTOR: Final[int] = 2
+
 # Streams webserver default port
 DEFAULT_PORT: Final[int] = 8097
 

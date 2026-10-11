@@ -35,6 +35,8 @@ def _controller() -> PlayerQueuesController:
     ctrl = PlayerQueuesController.__new__(PlayerQueuesController)
     ctrl.signal_update = Mock()  # type: ignore[method-assign]
     ctrl.mass = MagicMock()
+    ctrl.mass.streams.transcode_sessions.terminate_queue_sessions = AsyncMock()
+    ctrl.mass.streams.transcode_sessions.terminate_for_item = AsyncMock()
     return ctrl
 
 
